@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package orchestrator;
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum TaskState {
+  PENDING   = 0;
+  ASSIGNED  = 1;
+  RUNNING   = 2;
+  COMPLETED = 3;
+  FAILED    = 4;
+}
+
+enum TaskPriority {
+  LOW    = 0;
+  NORMAL = 1;
+  HIGH   = 2;
+  URGENT = 3;
+}
+
+// ─────────────────────────────────────────────
+// Messages
+// ─────────────────────────────────────────────
+
+message TaskPayload {
+  string task_id    = 1;
+  TaskPriority priority = 2;
+  string payload    = 3;  // opaque work description
+}
+
+message TaskResult {
+  string task_id    = 1;
+  TaskState state   = 2;
+  string result     = 3;  // output from worker
+  string error      = 4;  // error message if FAILED
+  int64 latency_ms  = 5;  // end-to-end latency
+}
+
+// ─────────────────────────────────────────────
+// Client → Coordinator
+// ─────────────────────────────────────────────
+
+message SubmitTaskRequest {
+  TaskPriority priority = 1;
+  string payload        = 2;
+}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+}
+
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+message GetTaskStatusResponse {
+  string task_id    = 1;
+  TaskState state   = 2;
+  string result     = 3;
+  string error      = 4;
+  int64 latency_ms  = 5;
+}
+
+// ─────────────────────────────────────────────
+// Coordinator → Worker
+// ─────────────────────────────────────────────
+
+message AssignTaskRequest {
+  TaskPayload task = 1;
+}
+
+message AssignTaskResponse {
+  bool accepted = 1;
+}
+
+// ─────────────────────────────────────────────
+// Worker → Coordinator
+// ─────────────────────────────────────────────
+
+message RegisterWorkerRequest {
+  string worker_id   = 1;
+  string address     = 2;  // host:port
+  int32 capacity     = 3;  // max concurrent tasks
+}
+
+message RegisterWorkerResponse {
+  bool success = 1;
+}
+
+message HeartbeatRequest {
+  string worker_id       = 1;
+  int32 active_tasks     = 2;
+  int32 completed_tasks  = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+}
+
+message ReportResultRequest {
+  string worker_id = 1;
+  TaskResult result = 2;
+}
+
+message ReportResultResponse {
+  bool acknowledged = 1;
+}
+
+// ─────────────────────────────────────────────
+// Services
+// ─────────────────────────────────────────────
+
+// Clients call this to submit work and check status
+service CoordinatorService {
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+}
+
+// Workers call this to register, heartbeat, and report results
+service WorkerRegistryService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
+}
+
+// Coordinator calls this on workers to assign tasks
+service WorkerService {
+  rpc AssignTask(AssignTaskRequest) returns (AssignTaskResponse);
+}

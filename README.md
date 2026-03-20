@@ -209,3 +209,7 @@ The system has two independent recovery mechanisms:
 - **Terminal metrics** — Real-time throughput, p50/p95/p99 latency, queue depth printed every 5 seconds
 - **Graceful shutdown** — Workers drain in-flight tasks before exiting on SIGTERM
 - **GetMetrics RPC** — Programmatic access to coordinator metrics
+
+
+
+Created by David Ha

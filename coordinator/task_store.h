@@ -27,6 +27,7 @@ struct TaskRecord {
     std::string result;
     std::string error;
     int64_t created_at_ms;
+    int64_t assigned_at_ms;  // when last dispatched to a worker
     int64_t completed_at_ms;
 };
 
@@ -94,6 +95,7 @@ public:
 
         it->second.state = orchestrator::ASSIGNED;
         it->second.assigned_worker = worker_id;
+        it->second.assigned_at_ms = now_ms();
         return true;
     }
 
@@ -131,11 +133,18 @@ public:
         return true;
     }
 
-    // Re-queue a task (e.g., after worker failure)
+    // Re-queue a task (e.g., after worker failure).
+    // Returns false without modifying if the task already reached a terminal
+    // state — guards against a race where a worker completes a task just as
+    // the health checker is requeueing it.
     bool requeue_task(const std::string& task_id) {
         std::unique_lock lock(mutex_);
         auto it = tasks_.find(task_id);
         if (it == tasks_.end()) return false;
+
+        auto state = it->second.state;
+        if (state == orchestrator::COMPLETED || state == orchestrator::FAILED)
+            return false;
 
         it->second.state = orchestrator::PENDING;
         it->second.assigned_worker.clear();
@@ -149,6 +158,23 @@ public:
         auto it = tasks_.find(task_id);
         if (it == tasks_.end()) return std::nullopt;
         return it->second;
+    }
+
+    // Get task IDs stuck in ASSIGNED/RUNNING for longer than timeout_ms.
+    // Catches tasks on workers that are alive but silently failing to report.
+    std::vector<std::string> get_timed_out_tasks(int64_t timeout_ms) const {
+        std::shared_lock lock(mutex_);
+        std::vector<std::string> result;
+        int64_t cutoff = now_ms() - timeout_ms;
+        for (const auto& [id, record] : tasks_) {
+            if ((record.state == orchestrator::ASSIGNED ||
+                 record.state == orchestrator::RUNNING) &&
+                record.assigned_at_ms > 0 &&
+                record.assigned_at_ms < cutoff) {
+                result.push_back(id);
+            }
+        }
+        return result;
     }
 
     // Get all task IDs assigned to a specific worker

@@ -1,5 +1,11 @@
+#include <algorithm>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -18,6 +24,7 @@ struct ClientConfig {
     std::string task_id;          // for status queries
     bool batch = false;
     int batch_count = 10;
+    bool random_priority = false;
 };
 
 void print_usage() {
@@ -32,11 +39,13 @@ void print_usage() {
         << "  --priority N             Priority 0-3: LOW/NORMAL/HIGH/URGENT (default: 1)\n"
         << "  --id TASK_ID             Task ID (for status)\n"
         << "  --batch N                Submit N tasks rapidly (for testing)\n"
+        << "  --random-priority        Assign random priorities in batch mode\n"
         << "  --help, -h               Show this help\n\n"
         << "Examples:\n"
-        << "  client submit --payload \"process_image_42\" --priority 2\n"
+        << "  client submit --payload \"999999937\" --priority 2\n"
         << "  client status --id abc12345-...\n"
-        << "  client submit --batch 50 --payload \"load_test\"\n";
+        << "  client submit --batch 100\n"
+        << "  client submit --batch 50 --payload \"1000000007\"\n";
 }
 
 ClientConfig parse_args(int argc, char* argv[]) {
@@ -59,6 +68,8 @@ ClientConfig parse_args(int argc, char* argv[]) {
         } else if (arg == "--batch" && i + 1 < argc) {
             config.batch = true;
             config.batch_count = std::stoi(argv[++i]);
+        } else if (arg == "--random-priority") {
+            config.random_priority = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
@@ -98,37 +109,112 @@ const char* priority_name(int p) {
 
 void do_submit(const ClientConfig& config,
                orchestrator::CoordinatorService::Stub& stub) {
-    if (config.payload.empty()) {
-        std::cerr << "Error: --payload is required for submit\n";
+    if (!config.batch && config.payload.empty()) {
+        std::cerr << "Error: --payload is required for single submit\n";
         std::exit(1);
     }
 
     if (config.batch) {
-        // Batch submit
+        // Batch submit — mix of small (fast) and large (slow) numbers to
+        // exercise load balancing across workers with variable task duration
+        std::mt19937_64 rng(std::random_device{}());
+        std::uniform_int_distribution<uint64_t> small_dist(2, 10000);
+        std::uniform_int_distribution<uint64_t> large_dist(1'000'000'000ULL,
+                                                            9'999'999'999ULL);
+        std::uniform_int_distribution<int> priority_dist(0, 3);
+
         std::cout << "Submitting " << config.batch_count << " tasks...\n";
         int64_t start = orch::now_ms();
 
+        std::vector<std::string> task_ids;
+        task_ids.reserve(config.batch_count);
+        int submit_failures = 0;
+
         for (int i = 0; i < config.batch_count; ++i) {
+            // Use provided payload, or auto-generate: 25% small, 75% large
+            std::string payload = config.payload.empty()
+                ? std::to_string(i % 4 == 0 ? small_dist(rng) : large_dist(rng))
+                : config.payload;
+
+            int p = config.random_priority ? priority_dist(rng) : config.priority;
+
             orchestrator::SubmitTaskRequest request;
-            request.set_priority(
-                static_cast<orchestrator::TaskPriority>(config.priority));
-            request.set_payload(config.payload + "_" + std::to_string(i));
+            request.set_priority(static_cast<orchestrator::TaskPriority>(p));
+            request.set_payload(payload);
 
             orchestrator::SubmitTaskResponse response;
             grpc::ClientContext context;
 
             grpc::Status status = stub.SubmitTask(&context, request, &response);
-            if (!status.ok()) {
-                std::cerr << "  [" << i << "] FAILED: "
+            if (status.ok()) {
+                task_ids.push_back(response.task_id());
+            } else {
+                submit_failures++;
+                std::cerr << "  [" << i << "] submit failed: "
                           << status.error_message() << "\n";
             }
         }
 
-        int64_t elapsed = orch::now_ms() - start;
-        double rate = (config.batch_count * 1000.0) / elapsed;
-        std::cout << "Submitted " << config.batch_count << " tasks in "
-                  << elapsed << "ms (" << std::fixed << std::setprecision(1)
-                  << rate << " tasks/sec)\n";
+        int64_t submit_elapsed = orch::now_ms() - start;
+        double rate = (config.batch_count * 1000.0) / submit_elapsed;
+        std::cout << "Submitted " << task_ids.size() << " tasks in "
+                  << submit_elapsed << "ms ("
+                  << std::fixed << std::setprecision(1) << rate << " tasks/sec)\n"
+                  << "Waiting for all tasks to complete...\n";
+
+        // Poll until every submitted task reaches a terminal state
+        std::vector<bool> done(task_ids.size(), false);
+        int completed = 0, exec_failed = 0;
+        int64_t total_latency_ms = 0;
+        int64_t min_latency_ms = std::numeric_limits<int64_t>::max();
+        int64_t max_latency_ms = 0;
+
+        while (true) {
+            int still_running = 0;
+            for (size_t i = 0; i < task_ids.size(); ++i) {
+                if (done[i]) continue;
+
+                orchestrator::GetTaskStatusRequest req;
+                req.set_task_id(task_ids[i]);
+                orchestrator::GetTaskStatusResponse resp;
+                grpc::ClientContext ctx;
+
+                grpc::Status s = stub.GetTaskStatus(&ctx, req, &resp);
+                if (!s.ok()) { still_running++; continue; }
+
+                auto state = resp.state();
+                if (state == orchestrator::COMPLETED || state == orchestrator::FAILED) {
+                    done[i] = true;
+                    if (state == orchestrator::COMPLETED) {
+                        completed++;
+                        int64_t lat = resp.latency_ms();
+                        total_latency_ms += lat;
+                        min_latency_ms = std::min(min_latency_ms, lat);
+                        max_latency_ms = std::max(max_latency_ms, lat);
+                    } else {
+                        exec_failed++;
+                    }
+                } else {
+                    still_running++;
+                }
+            }
+            if (still_running == 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        int64_t total_elapsed = orch::now_ms() - start;
+        int total_failed = submit_failures + exec_failed;
+
+        std::cout << "\nLoad test complete:\n"
+                  << "  Tasks submitted:  " << task_ids.size() << "\n"
+                  << "  Completed:        " << completed << "\n"
+                  << "  Failed:           " << total_failed << "\n"
+                  << "  Total time:       " << total_elapsed << "ms\n";
+        if (completed > 0) {
+            std::cout << "  Avg latency:      " << (total_latency_ms / completed) << "ms\n"
+                      << "  Min latency:      " << min_latency_ms << "ms\n"
+                      << "  Max latency:      " << max_latency_ms << "ms\n";
+        }
     } else {
         // Single submit
         orchestrator::SubmitTaskRequest request;

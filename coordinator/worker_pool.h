@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -62,23 +64,36 @@ public:
         return true;
     }
 
-    // Select the least-loaded alive worker with available capacity
-    // Returns nullopt if no workers are available
+    // Select the least-loaded alive worker with available capacity.
+    // When multiple workers are tied for minimum load, one is chosen at
+    // random to prevent the same worker winning every tie.
+    // Returns nullopt if no workers are available.
     std::optional<WorkerInfo> select_worker() const {
         std::shared_lock lock(mutex_);
 
-        const WorkerInfo* best = nullptr;
+        int32_t min_load = std::numeric_limits<int32_t>::max();
+        std::vector<const WorkerInfo*> candidates;
+
         for (const auto& [id, worker] : workers_) {
             if (!worker.alive) continue;
             if (worker.active_tasks >= worker.capacity) continue;
 
-            if (!best || worker.active_tasks < best->active_tasks) {
-                best = &worker;
+            if (worker.active_tasks < min_load) {
+                min_load = worker.active_tasks;
+                candidates.clear();
+                candidates.push_back(&worker);
+            } else if (worker.active_tasks == min_load) {
+                candidates.push_back(&worker);
             }
         }
 
-        if (best) return *best;
-        return std::nullopt;
+        if (candidates.empty()) return std::nullopt;
+        if (candidates.size() == 1) return *candidates[0];
+
+        // Break ties randomly
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+        return *candidates[dist(rng)];
     }
 
     // Increment a worker's active task count (after assignment)

@@ -65,6 +65,20 @@ grpc::Status WorkerRegistryServiceImpl::RegisterWorker(
     const orchestrator::RegisterWorkerRequest* request,
     orchestrator::RegisterWorkerResponse* response) {
 
+    // If this worker was previously registered with in-flight tasks (e.g. it
+    // crashed and restarted before the health check fired), requeue those tasks
+    // now — the new process has no memory of them.
+    auto existing = workers_.get_worker(request->worker_id());
+    if (existing) {
+        auto orphaned = tasks_.get_tasks_for_worker(request->worker_id());
+        for (const auto& task_id : orphaned) {
+            tasks_.requeue_task(task_id);
+            log_warn("Coordinator",
+                "Task " + task_id.substr(0, 8) +
+                "... requeued on worker re-registration");
+        }
+    }
+
     bool ok = workers_.register_worker(
         request->worker_id(), request->address(), request->capacity());
     response->set_success(ok);
@@ -122,8 +136,9 @@ grpc::Status WorkerRegistryServiceImpl::ReportResult(
         }
     }
 
-    // Decrement worker load
+    // Decrement worker load and wake the scheduler — a slot just opened up
     workers_.decrement_load(request->worker_id());
+    scheduler_.notify();
     response->set_acknowledged(ok);
 
     return grpc::Status::OK;

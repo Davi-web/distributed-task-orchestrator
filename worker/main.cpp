@@ -3,16 +3,54 @@
 #include <csignal>
 #include <iostream>
 #include <memory>
-#include <mutex>
-#include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 
 #include <grpcpp/grpcpp.h>
 
 #include "orchestrator.grpc.pb.h"
 #include "common/utils.h"
+
+// ─────────────────────────────────────────────
+// Prime checker — trial division up to sqrt(n)
+// Execution time scales naturally with input:
+//   n ~ 10^6  →  ~1ms
+//   n ~ 10^10 →  ~100ms
+//   n ~ 10^12 →  ~1s
+// ─────────────────────────────────────────────
+
+struct PrimeResult {
+    bool is_prime;
+    uint64_t smallest_factor;  // 0 if prime
+};
+
+PrimeResult check_prime(uint64_t n) {
+    if (n < 2)  return {false, 0};
+    if (n == 2) return {true, 0};
+    if (n % 2 == 0) return {false, 2};
+    if (n == 3) return {true, 0};
+    if (n % 3 == 0) return {false, 3};
+
+    // Trial division with 6k±1 optimisation
+    for (uint64_t i = 5; i * i <= n; i += 6) {
+        if (n % i == 0)     return {false, i};
+        if (n % (i+2) == 0) return {false, i + 2};
+    }
+    return {true, 0};
+}
+
+std::string run_prime_task(const std::string& payload) {
+    if (payload.empty() || payload.find_first_not_of("0123456789") != std::string::npos)
+        throw std::invalid_argument("payload must be a positive integer, got: \"" + payload + "\"");
+
+    uint64_t n = std::stoull(payload);
+    auto [is_prime, factor] = check_prime(n);
+    if (is_prime)
+        return std::to_string(n) + " is prime";
+    return std::to_string(n) + " is not prime (smallest factor: " +
+           std::to_string(factor) + ")";
+}
 
 // ─────────────────────────────────────────────
 // Global state
@@ -36,9 +74,7 @@ struct WorkerConfig {
     std::string listen_address = "0.0.0.0";
     std::string listen_port = "50052";
     std::string worker_id;
-    int32_t capacity = 4;
-    int32_t min_exec_ms = 100;
-    int32_t max_exec_ms = 2000;
+    int32_t capacity = 2;
 };
 
 WorkerConfig parse_args(int argc, char* argv[]) {
@@ -55,19 +91,15 @@ WorkerConfig parse_args(int argc, char* argv[]) {
             config.worker_id = argv[++i];
         } else if ((arg == "--capacity") && i + 1 < argc) {
             config.capacity = std::stoi(argv[++i]);
-        } else if ((arg == "--min-exec") && i + 1 < argc) {
-            config.min_exec_ms = std::stoi(argv[++i]);
-        } else if ((arg == "--max-exec") && i + 1 < argc) {
-            config.max_exec_ms = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: worker [options]\n"
                       << "  --coordinator, -c ADDR  Coordinator address (default: localhost:50051)\n"
                       << "  --port, -p PORT         Listen port (default: 50052)\n"
                       << "  --id ID                 Worker ID (default: auto-generated)\n"
                       << "  --capacity N            Max concurrent tasks (default: 4)\n"
-                      << "  --min-exec MS           Min execution time in ms (default: 100)\n"
-                      << "  --max-exec MS           Max execution time in ms (default: 2000)\n"
-                      << "  --help, -h              Show this help\n";
+                      << "  --help, -h              Show this help\n"
+                      << "\nTask payloads are integers to check for primality.\n"
+                      << "Examples: \"7\"  \"999999937\"  \"1000000007\"\n";
             std::exit(0);
         }
     }
@@ -82,8 +114,7 @@ class WorkerServiceImpl final : public orchestrator::WorkerService::Service {
 public:
     WorkerServiceImpl(const WorkerConfig& config,
                       orchestrator::WorkerRegistryService::Stub* registry)
-        : config_(config), registry_(std::move(registry)),
-          rng_(std::random_device{}()) {}
+        : config_(config), registry_(registry) {}
 
     grpc::Status AssignTask(
         grpc::ServerContext* context,
@@ -118,46 +149,52 @@ private:
     void execute_task(std::string task_id, std::string payload) {
         int64_t start_ms = orch::now_ms();
 
-        // Simulate work with random duration
-        int exec_ms;
-        {
-            std::lock_guard lock(rng_mutex_);
-            std::uniform_int_distribution<int> dist(
-                config_.min_exec_ms, config_.max_exec_ms);
-            exec_ms = dist(rng_);
-        }
+        orch::log_info("Worker", "Checking prime: " + payload);
 
-        orch::log_info("Worker", "Executing task " +
-            task_id.substr(0, 8) + "... (simulated " +
-            std::to_string(exec_ms) + "ms)");
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(exec_ms));
-
-        int64_t latency_ms = orch::now_ms() - start_ms;
-
-        // Report result back to coordinator
         orchestrator::ReportResultRequest report;
         report.set_worker_id(config_.worker_id);
         auto* result = report.mutable_result();
         result->set_task_id(task_id);
-        result->set_state(orchestrator::COMPLETED);
-        result->set_result("Processed: " + payload);
-        result->set_latency_ms(latency_ms);
 
-        orchestrator::ReportResultResponse report_response;
-        grpc::ClientContext ctx;
-        ctx.set_deadline(std::chrono::system_clock::now() +
-                         std::chrono::seconds(5));
-
-        grpc::Status status = registry_->ReportResult(
-            &ctx, report, &report_response);
-
-        if (status.ok()) {
+        try {
+            std::string answer = run_prime_task(payload);
+            result->set_state(orchestrator::COMPLETED);
+            result->set_result(answer);
             orch::log_info("Worker", "Task " + task_id.substr(0, 8) +
-                "... completed (" + std::to_string(latency_ms) + "ms)");
-        } else {
-            orch::log_error("Worker", "Failed to report result for " +
-                task_id.substr(0, 8) + "...: " + status.error_message());
+                "... result: " + answer);
+        } catch (const std::exception& e) {
+            result->set_state(orchestrator::FAILED);
+            result->set_error(std::string("invalid payload: ") + e.what());
+            orch::log_warn("Worker", "Task " + task_id.substr(0, 8) +
+                "... failed: " + e.what());
+        }
+
+        result->set_latency_ms(orch::now_ms() - start_ms);
+
+        // Retry ReportResult — a transient error (coordinator busy, brief
+        // network hiccup) must not silently orphan the task on the coordinator.
+        constexpr int kMaxAttempts = 5;
+        for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+            orchestrator::ReportResultResponse report_response;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() +
+                             std::chrono::seconds(5));
+
+            grpc::Status status = registry_->ReportResult(&ctx, report, &report_response);
+            if (status.ok()) break;
+
+            orch::log_warn("Worker", "ReportResult attempt " +
+                std::to_string(attempt) + "/" + std::to_string(kMaxAttempts) +
+                " failed for " + task_id.substr(0, 8) +
+                "...: " + status.error_message());
+
+            if (attempt < kMaxAttempts) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200 * attempt));
+            } else {
+                orch::log_error("Worker", "Giving up on ReportResult for " +
+                    task_id.substr(0, 8) + "... after " +
+                    std::to_string(kMaxAttempts) + " attempts");
+            }
         }
 
         g_active_tasks--;
@@ -166,8 +203,6 @@ private:
 
     const WorkerConfig& config_;
     orchestrator::WorkerRegistryService::Stub* registry_;
-    std::mt19937 rng_;
-    std::mutex rng_mutex_;
 };
 
 // ─────────────────────────────────────────────
@@ -215,6 +250,10 @@ int main(int argc, char* argv[]) {
     auto registry = orchestrator::WorkerRegistryService::NewStub(channel);
 
     // Register with coordinator
+    if (!registry) {
+        orch::log_error("Worker", "Failed to create gRPC stub for coordinator");
+        return 1;
+    }
     std::string full_address = config.listen_address + ":" + config.listen_port;
 
     orchestrator::RegisterWorkerRequest reg_request;

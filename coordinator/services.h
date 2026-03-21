@@ -5,6 +5,7 @@
 #include <atomic>
 
 #include "orchestrator.grpc.pb.h"
+#include "coordinator/metrics.h"
 #include "coordinator/task_store.h"
 #include "coordinator/worker_pool.h"
 #include "common/utils.h"
@@ -53,8 +54,12 @@ class WorkerRegistryServiceImpl final
     : public orchestrator::WorkerRegistryService::Service {
 public:
     WorkerRegistryServiceImpl(TaskStore& tasks, WorkerPool& workers,
-                              Scheduler& scheduler)
-        : tasks_(tasks), workers_(workers), scheduler_(scheduler) {}
+                              Scheduler& scheduler,
+                              MetricsCollector& metrics)
+        : tasks_(tasks),
+          workers_(workers),
+          scheduler_(scheduler),
+          metrics_(metrics) {}
 
     grpc::Status RegisterWorker(
         grpc::ServerContext* context,
@@ -75,6 +80,7 @@ private:
     TaskStore& tasks_;
     WorkerPool& workers_;
     Scheduler& scheduler_;
+    MetricsCollector& metrics_;
 };
 
 }  // namespace orch

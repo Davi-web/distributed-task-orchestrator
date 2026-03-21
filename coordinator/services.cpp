@@ -122,6 +122,7 @@ grpc::Status WorkerRegistryServiceImpl::ReportResult(
     if (result.state() == orchestrator::COMPLETED) {
         ok = tasks_.complete_task(result.task_id(), result.result());
         if (ok) {
+            metrics_.record_completion(result.latency_ms(), true);
             log_info("Coordinator",
                 "Task " + result.task_id().substr(0, 8) +
                 "... COMPLETED (latency: " +
@@ -130,6 +131,7 @@ grpc::Status WorkerRegistryServiceImpl::ReportResult(
     } else if (result.state() == orchestrator::FAILED) {
         ok = tasks_.fail_task(result.task_id(), result.error());
         if (ok) {
+            metrics_.record_completion(result.latency_ms(), false);
             log_warn("Coordinator",
                 "Task " + result.task_id().substr(0, 8) +
                 "... FAILED: " + result.error());

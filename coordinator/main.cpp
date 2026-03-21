@@ -6,6 +6,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "coordinator/services.h"
+#include "coordinator/metrics.h"
 #include "coordinator/scheduler.h"
 #include "coordinator/task_store.h"
 #include "coordinator/worker_pool.h"
@@ -59,11 +60,13 @@ int main(int argc, char* argv[]) {
     // Core components
     orch::TaskStore tasks;
     orch::WorkerPool workers;
+    orch::MetricsCollector metrics(tasks, workers);
     orch::Scheduler scheduler(tasks, workers);
 
     // gRPC services
     orch::CoordinatorServiceImpl coordinator_service(tasks, scheduler);
-    orch::WorkerRegistryServiceImpl registry_service(tasks, workers, scheduler);
+    orch::WorkerRegistryServiceImpl registry_service(
+        tasks, workers, scheduler, metrics);
 
     // Build and start server
     grpc::ServerBuilder builder;
@@ -80,6 +83,7 @@ int main(int argc, char* argv[]) {
     orch::log_info("Coordinator", "Listening on " + config.address);
 
     // Start the dispatch loop
+    metrics.start();
     scheduler.start();
 
     // Wait for shutdown signal
@@ -89,6 +93,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     scheduler.stop();
+    metrics.stop();
     server->Shutdown();
     orch::log_info("Coordinator", "Server shut down cleanly");
 

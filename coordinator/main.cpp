@@ -64,7 +64,7 @@ int main(int argc, char* argv[]) {
     orch::Scheduler scheduler(tasks, workers);
 
     // gRPC services
-    orch::CoordinatorServiceImpl coordinator_service(tasks, scheduler);
+    orch::CoordinatorServiceImpl coordinator_service(tasks, scheduler, metrics);
     orch::WorkerRegistryServiceImpl registry_service(
         tasks, workers, scheduler, metrics);
 

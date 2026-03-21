@@ -19,6 +19,17 @@
 
 namespace orch {
 
+struct MetricsSnapshot {
+    double throughput_tasks_per_sec = 0.0;
+    int64_t p50_latency_ms = 0;
+    int64_t p95_latency_ms = 0;
+    int64_t p99_latency_ms = 0;
+    int64_t queue_depth = 0;
+    int64_t alive_workers = 0;
+    int64_t total_ok = 0;
+    int64_t total_err = 0;
+};
+
 class MetricsCollector {
 public:
     explicit MetricsCollector(const TaskStore& tasks,
@@ -71,27 +82,7 @@ public:
         }
     }
 
-private:
-    struct CompletionSample {
-        int64_t latency_ms;
-        int64_t completed_at_ms;
-    };
-
-    void run() {
-        std::unique_lock<std::mutex> lock(cv_mutex_);
-        while (running_) {
-            if (cv_.wait_for(lock, std::chrono::seconds(5),
-                             [this]() { return !running_.load(); })) {
-                break;
-            }
-
-            lock.unlock();
-            print_snapshot();
-            lock.lock();
-        }
-    }
-
-    void print_snapshot() const {
+    MetricsSnapshot snapshot() const {
         std::vector<int64_t> latencies;
         size_t completions_last_5s = 0;
         int64_t total_ok = 0;
@@ -113,15 +104,50 @@ private:
 
         std::sort(latencies.begin(), latencies.end());
 
+        MetricsSnapshot snapshot;
+        snapshot.throughput_tasks_per_sec = completions_last_5s / 5.0;
+        snapshot.p50_latency_ms = percentile(latencies, 50);
+        snapshot.p95_latency_ms = percentile(latencies, 95);
+        snapshot.p99_latency_ms = percentile(latencies, 99);
+        snapshot.queue_depth = static_cast<int64_t>(tasks_.pending_count());
+        snapshot.alive_workers = static_cast<int64_t>(workers_.alive_count());
+        snapshot.total_ok = total_ok;
+        snapshot.total_err = total_err;
+        return snapshot;
+    }
+
+private:
+    struct CompletionSample {
+        int64_t latency_ms;
+        int64_t completed_at_ms;
+    };
+
+    void run() {
+        std::unique_lock<std::mutex> lock(cv_mutex_);
+        while (running_) {
+            if (cv_.wait_for(lock, std::chrono::seconds(5),
+                             [this]() { return !running_.load(); })) {
+                break;
+            }
+
+            lock.unlock();
+            print_snapshot();
+            lock.lock();
+        }
+    }
+
+    void print_snapshot() const {
+        const MetricsSnapshot metrics = snapshot();
         std::ostringstream line;
         line << std::fixed << std::setprecision(1)
-             << "[Metrics] throughput=" << (completions_last_5s / 5.0)
-             << " tasks/s | p50=" << percentile(latencies, 50) << "ms"
-             << " p95=" << percentile(latencies, 95) << "ms"
-             << " p99=" << percentile(latencies, 99) << "ms"
-             << " | queue=" << tasks_.pending_count()
-             << " | workers=" << workers_.alive_count() << " alive"
-             << " | total: " << total_ok << " ok / " << total_err << " err";
+             << "[Metrics] throughput=" << metrics.throughput_tasks_per_sec
+             << " tasks/s | p50=" << metrics.p50_latency_ms << "ms"
+             << " p95=" << metrics.p95_latency_ms << "ms"
+             << " p99=" << metrics.p99_latency_ms << "ms"
+             << " | queue=" << metrics.queue_depth
+             << " | workers=" << metrics.alive_workers << " alive"
+             << " | total: " << metrics.total_ok << " ok / "
+             << metrics.total_err << " err";
 
         std::cout << line.str() << std::endl;
     }

@@ -56,6 +56,24 @@ grpc::Status CoordinatorServiceImpl::GetTaskStatus(
     return grpc::Status::OK;
 }
 
+grpc::Status CoordinatorServiceImpl::GetMetrics(
+    grpc::ServerContext* context,
+    const orchestrator::GetMetricsRequest* request,
+    orchestrator::GetMetricsResponse* response) {
+
+    const MetricsSnapshot metrics = metrics_.snapshot();
+    response->set_throughput_tasks_per_sec(metrics.throughput_tasks_per_sec);
+    response->set_p50_latency_ms(metrics.p50_latency_ms);
+    response->set_p95_latency_ms(metrics.p95_latency_ms);
+    response->set_p99_latency_ms(metrics.p99_latency_ms);
+    response->set_queue_depth(metrics.queue_depth);
+    response->set_alive_workers(metrics.alive_workers);
+    response->set_total_ok(metrics.total_ok);
+    response->set_total_err(metrics.total_err);
+
+    return grpc::Status::OK;
+}
+
 // ─────────────────────────────────────────────
 // WorkerRegistryService (Worker-facing)
 // ─────────────────────────────────────────────

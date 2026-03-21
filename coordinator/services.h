@@ -27,8 +27,9 @@ class Scheduler;
 class CoordinatorServiceImpl final
     : public orchestrator::CoordinatorService::Service {
 public:
-    CoordinatorServiceImpl(TaskStore& tasks, Scheduler& scheduler)
-        : tasks_(tasks), scheduler_(scheduler) {}
+    CoordinatorServiceImpl(TaskStore& tasks, Scheduler& scheduler,
+                           MetricsCollector& metrics)
+        : tasks_(tasks), scheduler_(scheduler), metrics_(metrics) {}
 
     grpc::Status SubmitTask(
         grpc::ServerContext* context,
@@ -40,9 +41,15 @@ public:
         const orchestrator::GetTaskStatusRequest* request,
         orchestrator::GetTaskStatusResponse* response) override;
 
+    grpc::Status GetMetrics(
+        grpc::ServerContext* context,
+        const orchestrator::GetMetricsRequest* request,
+        orchestrator::GetMetricsResponse* response) override;
+
 private:
     TaskStore& tasks_;
     Scheduler& scheduler_;
+    MetricsCollector& metrics_;
 };
 
 // ─────────────────────────────────────────────

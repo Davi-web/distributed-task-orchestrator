@@ -57,11 +57,13 @@ std::string run_prime_task(const std::string& payload) {
 // ─────────────────────────────────────────────
 
 static std::atomic<bool> g_shutdown{false};
+static std::atomic<bool> g_draining{false};
 static std::atomic<int32_t> g_active_tasks{0};
 static std::atomic<int32_t> g_completed_tasks{0};
 
 void signal_handler(int signal) {
     orch::log_info("Worker", "Shutting down (signal " + std::to_string(signal) + ")...");
+    g_draining = true;
     g_shutdown = true;
 }
 
@@ -122,6 +124,13 @@ public:
         orchestrator::AssignTaskResponse* response) override {
 
         const auto& task = request->task();
+
+        if (g_draining) {
+            response->set_accepted(false);
+            orch::log_warn("Worker", "Rejected task " +
+                task.task_id().substr(0, 8) + "... (draining)");
+            return grpc::Status::OK;
+        }
 
         // Check capacity
         if (g_active_tasks >= config_.capacity) {
@@ -296,6 +305,10 @@ int main(int argc, char* argv[]) {
 
     // Wait for shutdown
     while (!g_shutdown) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    while (g_active_tasks > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
